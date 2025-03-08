@@ -6,7 +6,7 @@ CONFIG = {
             'min': 20,
             'max': 50
         },
-        'n_runs': 1000,  # Total number of cities to simulate
+        'n_runs': 100,  # Total number of cities to simulate
         'base_seed': 7354681  # For reproducibility
     }
 

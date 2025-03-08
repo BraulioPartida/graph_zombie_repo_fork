@@ -270,35 +270,147 @@ class EvacuationPolicy:
         return PolicyResult(best_path, resources)
     
     def _policy_3(self, city: CityGraph, proxy_data: ProxyData, max_resources: int) -> PolicyResult:
-        SAFETY_THRESHOLDS = {
-            'radiation_critical': 0.6,
-            'radiation_warning': 0.5,
-            'population': 0.6,
-            'emergency': 0.5,
-            'thermal': (0.5, 0.6),
-            'seismic': 0.5,
-            'structural': 0.4,
-            'movement': 0.45
-        }
-        
-        graph = city.graph.copy()
-        
-        # 1. Calcular riesgos en nodos
-        node_risks, forced_radiation_nodes = self._compute_node_risks(graph, proxy_data, SAFETY_THRESHOLDS)
-        
-        # 2. Ajustar riesgos en aristas
-        self._adjust_edge_risks(graph, node_risks, proxy_data, SAFETY_THRESHOLDS, forced_radiation_nodes)
-        
-        # 3. Encontrar mejor camino
-        best_path = self._find_optimal_path(graph, city, proxy_data, SAFETY_THRESHOLDS)
-        
-        # 4. Calcular necesidades de recursos
-        resource_needs, critical_radiation_nodes = self._calculate_resource_needs(best_path, proxy_data, SAFETY_THRESHOLDS)
-        
-        # 5. Asignar recursos
-        final_resources = self._allocate_resources(resource_needs, critical_radiation_nodes, max_resources)
-        
-        return PolicyResult(best_path, final_resources)
+            graph = city.graph
+            start = city.starting_node
+            extraction_nodes = city.extraction_nodes
+
+            # 1. Filtrar nodos con radiación letal (excepto el nodo de inicio)
+            nodes_to_remove = [
+                node for node in graph.nodes 
+                if node != start and proxy_data.node_data[node].get("radiation_readings", 0) >= 0.75
+            ]
+            filtered_graph = graph.copy()
+            filtered_graph.remove_nodes_from(nodes_to_remove)
+
+            # 2. Filtrar aristas peligrosas
+            edges_to_remove = []
+            for u, v in filtered_graph.edges():
+                edge_key = (u, v) if (u, v) in proxy_data.edge_data else (v, u)
+                if edge_key in proxy_data.edge_data:
+                    hazard = proxy_data.edge_data[edge_key].get("hazard_gradient", 0)
+                    if hazard >= 0.7:
+                        edges_to_remove.append((u, v))
+            filtered_graph.remove_edges_from(edges_to_remove)
+
+            # 3. Validar nodos de extracción
+            valid_extraction_nodes = [node for node in extraction_nodes if node in filtered_graph]
+
+            # 4. Buscar camino más corto
+            best_path = None
+            min_length = float("inf")
+            for target in valid_extraction_nodes:
+                try:
+                    path_length = nx.shortest_path_length(filtered_graph, start, target, weight="weight")
+                    if path_length < min_length:
+                        min_length = path_length
+                        best_path = nx.shortest_path(filtered_graph, start, target, weight="weight")
+                except nx.NetworkXNoPath:
+                    continue
+
+            # 5. Asignar ruta final (asegurar que el nodo de inicio siempre está incluido)
+            final_path = best_path if best_path else [start]
+
+            # 5. Manejar caso sin caminos válidos
+            if not best_path:
+                return PolicyResult([start], {"explosives": 0, "ammo": 0, "radiation_suits": 0})
+            
+            # Paso 4: Encontrar camino más corto usando Dijkstra
+            best_path = None
+            min_length = float("inf")
+            for target in valid_extraction_nodes:
+                try:
+                    path_length = nx.shortest_path_length(filtered_graph, start, target, weight="weight")
+                    if path_length < min_length:
+                        min_length = path_length
+                        best_path = nx.shortest_path(filtered_graph, start, target, weight="weight")
+                except nx.NetworkXNoPath:
+                    continue
+            
+            # Caso especial: No hay camino válido
+            if not best_path:
+                return PolicyResult([start], {"explosives": 0, "ammo": 0, "radiation_suits": 0})
+            
+            # Paso 5: Calcular recursos basados en máxima probabilidad
+            explosives = 0
+            suits = 0
+            ammo = 0
+
+            # Procesamiento de nodos
+            for node in best_path:
+                node_data = proxy_data.node_data[node]
+                si = node_data.get("structural_integrity", 1)  # 1 = integridad perfecta
+                sa = node_data.get("seismic_activity", 0)
+                rad = node_data.get("radiation_readings", 0)
+                pop = node_data.get("population_density", 0)
+                emer = node_data.get("emergency_calls", 0)
+                therm = node_data.get("thermal_readings", 0)
+
+                # Cálculo de puntuaciones para cada recurso
+                scores = {
+                    "explosives": 0,
+                    "radiation_suits": 0,
+                    "ammo": 0
+                }
+
+                # Explosivos: Prioriza daño estructural severo (si <= 0.3) o actividad sísmica alta
+                explosive_conditions = []
+                if si <= 0.3:
+                    explosive_conditions.append(1 - si)  # Invertir escala (mayor daño -> mayor puntuación)
+                if 0.1 < si <= 0.3 and 0.3 < sa < 1:
+                    explosive_conditions.append(sa)
+                if explosive_conditions:
+                    scores["explosives"] = max(explosive_conditions)
+
+                # Trajes: Radiación cercana a niveles letales (0.3 < rad < 0.75)
+                if 0.3 < rad < 0.75:
+                    scores["radiation_suits"] = (rad - 0.3) / 0.45  # Escalado lineal a [0, 1]
+
+                # Munición: Alta densidad poblacional/emergencias o actividad térmica moderada
+                ammo_conditions = []
+                if pop >= 0.6 or emer >= 0.6:
+                    ammo_conditions.append(max(pop, emer))
+                if 0.4 <= therm < 0.6:
+                    ammo_conditions.append(therm)
+                if ammo_conditions:
+                    scores["ammo"] = max(ammo_conditions)
+
+                # Seleccionar recurso con máxima puntuación
+                max_score = max(scores.values())
+                if max_score > 0:
+                    selected = [k for k, v in scores.items() if v == max_score][0]  # En caso de empate, selecciona el primero
+                    if selected == "explosives":
+                        explosives += 1
+                    elif selected == "radiation_suits":
+                        suits += 1
+                    else:
+                        ammo += 1
+
+            # Procesamiento de aristas
+            for i in range(len(best_path) - 1):
+                u, v = best_path[i], best_path[i + 1]
+                edge_key = (u, v) if (u, v) in proxy_data.edge_data else (v, u)
+                if edge_key not in proxy_data.edge_data:
+                    continue
+
+                edge_data = proxy_data.edge_data[edge_key]
+                sd = edge_data.get("structural_damage", 0)
+                dd = edge_data.get("debris_density", 0)
+                sig = edge_data.get("signal_interference", 0)
+
+                # Comparar daño estructural vs interferencia
+                explosive_score = max(sd, dd) if (sd >= 0.6 or dd >= 0.6) else 0
+                suit_score = sig if sig >= 0.6 else 0
+
+                if explosive_score > suit_score:
+                    explosives += 1
+                elif suit_score > explosive_score:
+                    suits += 1
+
+            return PolicyResult(final_path, {
+                "explosives": min(explosives, max_resources),
+                "ammo": min(ammo, max_resources),
+                "radiation_suits": min(suits, max_resources),
+            })
     
     def _policy_4(self, city: CityGraph, proxy_data: ProxyData, max_resources: int) -> PolicyResult:
         """
